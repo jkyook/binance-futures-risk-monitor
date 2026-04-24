@@ -1637,6 +1637,9 @@ class _RiskWebHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:  # noqa: N802
         parsed = urlparse(self.path)
         try:
+            if parsed.path == "/healthz":
+                self._write_json(200, {"ok": True, "service": "bfut-risk-monitor"})
+                return
             if parsed.path in {"/", "/index.html"}:
                 self._write_bytes(200, _build_web_app_html().encode("utf-8"), "text/html; charset=utf-8")
                 return
@@ -1726,13 +1729,13 @@ def _parse_args() -> argparse.Namespace:
     )
     p.add_argument(
         "--host",
-        default="127.0.0.1",
+        default=os.environ.get("HOST", "127.0.0.1"),
         help="웹 서버 바인드 주소 (기본: %(default)s)",
     )
     p.add_argument(
         "--port",
         type=int,
-        default=8765,
+        default=int(os.environ.get("PORT", "8765")),
         help="웹 서버 포트 (기본: %(default)s)",
     )
     p.add_argument(
