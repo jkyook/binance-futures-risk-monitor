@@ -58,7 +58,7 @@ from futures_dashboard.data_service import (
 )
 
 # 기본 키 파일: UTF-8 텍스트, 1줄 API Key·2줄 Secret (.rtf면 macOS에서 textutil 변환)
-DEFAULT_BINANCE_CREDENTIALS_PATH = Path("/Users/yugjingwan/Documents/바이낸스.txt")
+DEFAULT_BINANCE_CREDENTIALS_PATH = Path("/Users/yugjingwan/Documents/바이낸스.txt")
 
 # 로컬 전용 보조: 파일·환경변수가 없을 때만 사용. 저장소에 커밋하지 마세요.
 HARDCODED_BINANCE_API_KEY = ""

@@ -5,6 +5,7 @@ another repository checkout.
 """
 from __future__ import annotations
 
+from decimal import Decimal, ROUND_DOWN
 import os
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -12,6 +13,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
 import pytz
+
 from binance.client import Client
 
 
@@ -70,6 +72,85 @@ def fetch_positions(client: Client) -> List[Dict[str, Any]]:
 
 def fetch_open_orders(client: Client) -> List[Dict[str, Any]]:
     return client.futures_get_open_orders() or []
+
+
+def get_usdm_trading_symbols(client: Client) -> List[str]:
+    info = client.futures_exchange_info()
+    symbols: List[str] = []
+    for sym in info.get("symbols", []) or []:
+        if sym.get("status") != "TRADING":
+            continue
+        if sym.get("quoteAsset") != "USDT":
+            continue
+        if sym.get("contractType") != "PERPETUAL":
+            continue
+        symbol = sym.get("symbol")
+        if symbol:
+            symbols.append(symbol)
+    return sorted(set(symbols))
+
+
+def get_usdm_symbol_rules(client: Client) -> Dict[str, Dict[str, float]]:
+    info = client.futures_exchange_info()
+    rules: Dict[str, Dict[str, float]] = {}
+    for sym in info.get("symbols", []) or []:
+        if sym.get("status") != "TRADING":
+            continue
+        if sym.get("quoteAsset") != "USDT":
+            continue
+        if sym.get("contractType") != "PERPETUAL":
+            continue
+        symbol = sym.get("symbol")
+        if not symbol:
+            continue
+        filters = {f.get("filterType"): f for f in sym.get("filters", []) or []}
+        lot = filters.get("LOT_SIZE", {}) or {}
+        price = filters.get("PRICE_FILTER", {}) or {}
+        rules[symbol] = {
+            "step_size": _f(lot.get("stepSize"), 0.0),
+            "min_qty": _f(lot.get("minQty"), 0.0),
+            "tick_size": _f(price.get("tickSize"), 0.0),
+        }
+    return rules
+
+
+def normalize_order_quantity(client: Client, symbol: str, quantity: float) -> float:
+    quantity = abs(_f(quantity))
+    if quantity <= 0:
+        return 0.0
+    rules = get_usdm_symbol_rules(client).get(symbol, {})
+    step_size = _f(rules.get("step_size"), 0.0)
+    min_qty = _f(rules.get("min_qty"), 0.0)
+    if step_size <= 0:
+        rounded = quantity
+    else:
+        rounded = float((Decimal(str(quantity)) / Decimal(str(step_size))).to_integral_value(rounding=ROUND_DOWN) * Decimal(str(step_size)))
+    if rounded < min_qty:
+        return 0.0
+    return float(rounded)
+
+
+def cancel_open_orders_for_symbols(client: Client, symbols: List[str]) -> List[Dict[str, Any]]:
+    results: List[Dict[str, Any]] = []
+    for sym in sorted({s for s in symbols if s}):
+        try:
+            results.append({"symbol": sym, "result": client.futures_cancel_all_open_orders(symbol=sym)})
+        except Exception as exc:
+            results.append({"symbol": sym, "error": str(exc)})
+    return results
+
+
+def place_market_order(client: Client, symbol: str, side: str, quantity: float, *, reduce_only: bool = False) -> Dict[str, Any]:
+    qty = normalize_order_quantity(client, symbol, quantity)
+    if qty <= 0:
+        raise ValueError(f"{symbol} 주문 수량이 최소 단위보다 작습니다.")
+    payload: Dict[str, Any] = {
+        "symbol": symbol,
+        "side": side.upper(),
+        "quantity": f"{qty:.16f}".rstrip("0").rstrip("."),
+        "reduceOnly": "true" if reduce_only else "false",
+    }
+    return client.futures_create_order(**payload)
 
 
 def price_map_for_symbols(client: Client, symbols: List[str]) -> Dict[str, float]:
@@ -482,4 +563,3 @@ def load_full_snapshot(client: Client) -> Dict[str, Any]:
         "maint_buffer": maint_buffer,
         "margin_ratio_pct": margin_ratio_pct,
     }
-
