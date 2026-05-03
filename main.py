@@ -55,6 +55,8 @@ mpl.rcParams["axes.unicode_minus"] = False
 from futures_dashboard.data_service import (
     build_stress_curve,
     cancel_open_orders_for_symbols,
+    fetch_funding_income,
+    funding_income_to_dataframe,
     get_client,
     load_full_snapshot,
     order_distance_stats,
@@ -73,12 +75,19 @@ HISTORY_CSV_PATH = Path(__file__).resolve().parent / "futures_dashboard" / "moni
 
 
 def _is_number(value: Any) -> bool:
-    """숫자 여부 확인. pd.isna 대신 float() 변환 + NaN!=NaN 으로 재귀 방지."""
-    try:
-        f = float(value)
-        return f == f  # NaN 이면 False (NaN != NaN)
-    except (TypeError, ValueError, OverflowError):
-        return False
+    """type() 기반 숫자 체크 — isinstance/__instancecheck__ 재귀 완전 회피."""
+    t = type(value)
+    if t is int or t is float:
+        return value == value          # NaN check (NaN != NaN)
+    tn = t.__name__
+    if tn in ('int8','int16','int32','int64','uint8','uint16','uint32','uint64',
+              'float16','float32','float64','int_','float_','intp','longdouble'):
+        try:
+            f = value.item()           # numpy scalar → Python native
+            return (type(f) is int or type(f) is float) and f == f
+        except Exception:
+            return False
+    return False
 
 
 def _fmt_num(value: Any, digits: int = 2, signed: bool = False) -> str:
@@ -469,6 +478,164 @@ class PieChartPanel(QWidget):
             self.top5_layout.addWidget(card, row, col)
 
 
+
+class FundingPanel(QWidget):
+    """펀딩비 조회 패널: 테이블 + 누적 수익 차트."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(8)
+
+        # 상단 헤더
+        hdr = QHBoxLayout()
+        title = QLabel("펀딩비 내역")
+        title.setObjectName("SectionTitle")
+        self.days_spin = QSpinBox()
+        self.days_spin.setRange(1, 90)
+        self.days_spin.setValue(30)
+        self.days_spin.setSuffix(" 일")
+        self.days_spin.setFixedWidth(90)
+        self.fetch_btn = QPushButton("조회")
+        self.fetch_btn.setObjectName("PrimaryButton")
+        self.fetch_btn.setFixedWidth(72)
+        self.summary_label = QLabel("")
+        self.summary_label.setObjectName("SectionHint")
+        hdr.addWidget(title)
+        hdr.addSpacing(12)
+        hdr.addWidget(QLabel("기간:"))
+        hdr.addWidget(self.days_spin)
+        hdr.addWidget(self.fetch_btn)
+        hdr.addSpacing(16)
+        hdr.addWidget(self.summary_label)
+        hdr.addStretch(1)
+        layout.addLayout(hdr)
+
+        # 차트
+        self.figure = Figure(figsize=(10, 3.6), dpi=100)
+        self.figure.patch.set_facecolor("#0b101d")
+        self.canvas = FigureCanvas(self.figure)
+        self.canvas.setMinimumHeight(240)
+        layout.addWidget(self.canvas)
+
+        # 테이블
+        self.table = QTableWidget()
+        self.table.setAlternatingRowColors(True)
+        layout.addWidget(self.table, 1)
+
+    def update_data(self, df: "pd.DataFrame") -> None:
+        self.figure.clear()
+        self._update_chart(df)
+        self._update_table(df)
+        if df is not None and not df.empty:
+            total = float(df["income"].sum())
+            pos   = float(df[df["income"] > 0]["income"].sum())
+            neg   = float(df[df["income"] < 0]["income"].sum())
+            sign  = "+" if total >= 0 else ""
+            self.summary_label.setText(
+                f"합계 {sign}{total:,.4f} USDT  |  수입 +{pos:,.4f}  |  비용 {neg:,.4f}  |  {len(df)}건"
+            )
+        else:
+            self.summary_label.setText("데이터 없음")
+
+    def _update_chart(self, df: "pd.DataFrame") -> None:
+        BG       = "#0b101d"
+        BG_AX    = "#101b2e"
+        COL_POS  = "#47d9a8"
+        COL_NEG  = "#ff5c5c"
+        COL_CUM  = "#6b8cff"
+        COL_GRID = "#7c96b3"
+        COL_TICK = "#8aaac4"
+
+        ax = self.figure.add_subplot(111)
+        ax.set_facecolor(BG_AX)
+        for sp_name, sp in ax.spines.items():
+            if sp_name in ("bottom", "left"):
+                sp.set_color(COL_GRID); sp.set_alpha(0.45); sp.set_linewidth(1.15)
+            else:
+                sp.set_visible(False)
+        ax.tick_params(colors=COL_TICK, labelsize=8.5, length=3, width=0.8)
+        ax.yaxis.grid(True, color=COL_GRID, alpha=0.14, linewidth=0.8)
+        ax.set_axisbelow(True)
+
+        if df is None or df.empty:
+            ax.text(0.5, 0.5, "데이터 없음", ha="center", va="center",
+                    color="#64748b", fontsize=12)
+            ax.set_axis_off()
+            self.canvas.draw_idle()
+            return
+
+        import matplotlib.patheffects as _pe
+        ts  = pd.to_datetime(df["time_ms"], unit="ms", utc=True).dt.tz_convert("Asia/Seoul")
+        inc = df["income"].values
+        cum = df["income"].cumsum().values
+
+        # 바 차트 (수입/비용)
+        colors = [COL_POS if v >= 0 else COL_NEG for v in inc]
+        ax.bar(ts, inc, color=colors, alpha=0.65, width=pd.Timedelta(hours=6), zorder=2)
+
+        # 누적 라인 (오른쪽 축)
+        ax2 = ax.twinx()
+        ax2.set_facecolor("none")
+        for sp in ax2.spines.values():
+            sp.set_visible(False)
+        ax2.tick_params(axis="y", labelcolor=COL_CUM, labelsize=8.5, length=3, width=0.8)
+
+        ln, = ax2.plot(ts, cum, color=COL_CUM, linewidth=2.0, zorder=4,
+                       solid_capstyle="round", solid_joinstyle="round")
+        ln.set_path_effects([
+            _pe.SimpleLineShadow(shadow_color=COL_CUM, alpha=0.3, rho=0.6, linewidth=5),
+            _pe.Normal(),
+        ])
+        ax2.fill_between(ts, cum, alpha=0.10, color=COL_CUM, zorder=2)
+        ax2.axhline(0, color=COL_GRID, linewidth=0.8, linestyle="--", alpha=0.5)
+
+        # 최신 누적값 라벨
+        cum_last = float(cum[-1])
+        sign = "+" if cum_last >= 0 else ""
+        ax2.annotate(f" {sign}{cum_last:,.4f}", xy=(ts.iloc[-1], cum_last),
+                     fontsize=8.5, color=COL_CUM, fontweight="bold",
+                     xytext=(5, 0), textcoords="offset points")
+
+        ax.xaxis.set_major_formatter(mdates.DateFormatter("%m-%d"))
+        ax.xaxis.set_major_locator(mdates.AutoDateLocator())
+        ax.set_title("펀딩비 수익/비용 (막대) / 누적 (선)", color="#f5f9ff",
+                     fontsize=10, pad=8, fontweight="heavy", loc="left")
+        self.figure.autofmt_xdate(rotation=25, ha="right")
+        self.figure.tight_layout(pad=1.2)
+        self.canvas.draw_idle()
+
+    def _update_table(self, df: "pd.DataFrame") -> None:
+        if df is None or df.empty:
+            self.table.setRowCount(0)
+            self.table.setColumnCount(0)
+            return
+        cols = ["time_local", "symbol", "income", "asset"]
+        labels = {"time_local": "시간", "symbol": "심볼", "income": "펀딩비 (USDT)", "asset": "자산"}
+        self.table.setColumnCount(len(cols))
+        self.table.setHorizontalHeaderLabels([labels[c] for c in cols])
+        self.table.setRowCount(len(df))
+        self.table.setSortingEnabled(False)
+        for r, (_, row) in enumerate(df.iterrows()):
+            for c, col in enumerate(cols):
+                val = row[col]
+                if col == "income":
+                    text = f"{float(val):+,.6f}"
+                    item = NumericItem(text)
+                    item.setData(Qt.ItemDataRole.UserRole, float(val))
+                    item.setForeground(QBrush(QColor("#47d9a8") if float(val) >= 0 else QColor("#ff5c5c")))
+                else:
+                    item = QTableWidgetItem(str(val))
+                item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+                                      if col == "income" else
+                                      Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+                self.table.setItem(r, c, item)
+        self.table.horizontalHeader().setStretchLastSection(True)
+        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        self.table.verticalHeader().setVisible(False)
+        self.table.setSortingEnabled(True)
+
 class HistoryPanel(QWidget):
     def __init__(self) -> None:
         super().__init__()
@@ -703,6 +870,34 @@ def _populate_table(
     table.verticalHeader().setVisible(False)
     table.setSortingEnabled(sorting_enabled)
 
+
+
+class FundingWorker(QThread):
+    loaded = Signal(object)
+    failed = Signal(str)
+
+    def __init__(self, api_key: str, api_secret: str, key_file: str, days: int) -> None:
+        super().__init__()
+        self._api_key  = api_key
+        self._api_secret = api_secret
+        self._key_file = key_file
+        self._days     = days
+
+    def run(self) -> None:
+        try:
+            args = argparse.Namespace(
+                api_key=self._api_key,
+                api_secret=self._api_secret,
+                binance_key_file=self._key_file,
+            )
+            api_key, api_secret = _resolve_api_credentials(args)
+            client = get_client(api_key, api_secret)
+            records = fetch_funding_income(client, days=self._days)
+            df = funding_income_to_dataframe(records)
+            self.loaded.emit(df)
+        except Exception as exc:
+            import traceback as _tb
+            self.failed.emit(f"{exc}\n{_tb.format_exc()}")
 
 class SnapshotWorker(QThread):
     loaded = Signal(object)
@@ -1036,6 +1231,7 @@ class FuturesMonitor(QMainWindow):
 
         self._worker: Optional[SnapshotWorker] = None
         self._order_worker: Optional[OrderWorker] = None
+        self._funding_worker: Optional[FundingWorker] = None
         self._btc_worker: Optional[BtcPriceWorker] = None
         self._loading = False
         self._latest_payload: Optional[Dict[str, Any]] = None
@@ -1265,6 +1461,10 @@ class FuturesMonitor(QMainWindow):
         self.history_panel = HistoryPanel()
         self.history_panel.update_history(self._history_df)
         self.tabs.addTab(self.history_panel, "History")
+
+        self.funding_panel = FundingPanel()
+        self.funding_panel.fetch_btn.clicked.connect(self._fetch_funding)
+        self.tabs.addTab(self.funding_panel, "펀딩비")
         self.tabs.addTab(self._table_page(self.positions_table, "포지션", "futures_account_position_information 결과를 요약합니다."), "포지션")
         self.tabs.addTab(self._table_page(self.orders_table, "미체결", "현재 열려 있는 지정가/스톱 주문입니다."), "미체결")
         self.tabs.addTab(self._table_page(self.trades_table, "최근 체결", "최근 3일 체결 내역입니다."), "체결")
@@ -1676,6 +1876,32 @@ class FuturesMonitor(QMainWindow):
         layout.addWidget(self.single_auto_hint)
         layout.addStretch(1)
         return card
+
+
+    def _fetch_funding(self) -> None:
+        if self._funding_worker is not None and self._funding_worker.isRunning():
+            return
+        days = self.funding_panel.days_spin.value()
+        self.funding_panel.summary_label.setText("조회 중...")
+        self._funding_worker = FundingWorker(
+            self.api_key_edit.text().strip(),
+            self.api_secret_edit.text().strip(),
+            self.key_file_path,
+            days,
+        )
+        self._funding_worker.loaded.connect(self._on_funding_loaded)
+        self._funding_worker.failed.connect(self._on_funding_failed)
+        self._funding_worker.start()
+
+    def _on_funding_loaded(self, df: object) -> None:
+        import pandas as _pd
+        data = df if isinstance(df, _pd.DataFrame) else _pd.DataFrame()
+        self.funding_panel.update_data(data)
+        self._funding_worker = None
+
+    def _on_funding_failed(self, error: str) -> None:
+        self.funding_panel.summary_label.setText("조회 실패: " + error.splitlines()[0])
+        self._funding_worker = None
 
     def _show_order_dialog(self) -> None:
         if self._latest_payload and isinstance(self._latest_payload, dict):

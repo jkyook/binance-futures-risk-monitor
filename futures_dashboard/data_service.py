@@ -192,6 +192,44 @@ def get_collateral_assets(client: Client, account_raw: Optional[Dict] = None) ->
     return collateral
 
 
+
+def fetch_funding_income(client: "Client", days: int = 30) -> List[Dict[str, Any]]:
+    """최근 N일간 펀딩비 수익/비용 내역 조회 (FUNDING_FEE)."""
+    end = datetime.utcnow()
+    start = end - timedelta(days=days)
+    st = int(start.timestamp() * 1000)
+    et = int(end.timestamp() * 1000)
+    results: List[Dict[str, Any]] = []
+    try:
+        page = client.futures_income_history(
+            incomeType="FUNDING_FEE",
+            startTime=st,
+            endTime=et,
+            limit=1000,
+        )
+        results.extend(page or [])
+    except Exception:
+        pass
+    return sorted(results, key=lambda x: x.get("time", 0))
+
+
+def funding_income_to_dataframe(records: List[Dict[str, Any]], tz_name: str = "Asia/Seoul") -> "pd.DataFrame":
+    import pytz
+    tz = pytz.timezone(tz_name)
+    rows = []
+    for r in records:
+        income = _f(r.get("income"))
+        ts_ms = int(r.get("time", 0))
+        dt = datetime.utcfromtimestamp(ts_ms / 1000.0).replace(tzinfo=pytz.utc).astimezone(tz)
+        rows.append({
+            "symbol":     r.get("symbol", ""),
+            "income":     income,
+            "asset":      r.get("asset", "USDT"),
+            "time_local": dt.strftime("%Y-%m-%d %H:%M"),
+            "time_ms":    ts_ms,
+        })
+    return pd.DataFrame(rows)
+
 def fetch_trades_window(client: Client, start: datetime, end: datetime) -> List[Dict[str, Any]]:
     st = int(start.timestamp() * 1000)
     et = int(end.timestamp() * 1000)
